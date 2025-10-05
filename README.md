@@ -1,5 +1,7 @@
-Currently ongoing project, can't bypass any anti-virus for now.\n
-Honestly nowadays AI is so fucking powerful!\n
+Currently ongoing project, can't bypass any anti-virus for now.
+
+Honestly nowadays AI is so fucking powerful!
+
 Used process injection and registry technique.
 School project LoL
 Current functionality:
