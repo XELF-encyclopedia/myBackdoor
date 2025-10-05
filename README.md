@@ -16,3 +16,4 @@ Pending adding functionality:
   encrypted communication between Client and Host
   bypass Anti-Virus via multiple layer process injecion, memory execution or something else
   persistent backdoor implemention
+Legal Warning: Please test it under authorized device!
