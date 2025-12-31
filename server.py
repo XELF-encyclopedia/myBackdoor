@@ -85,6 +85,9 @@ class RemoteServer:
         """Handle communication with a specific client"""
         while self.running and client_id in self.clients:
             try:
+                if hasattr(self, 'pending_commands') and client_id in self.pending_commands:
+                    command = self.pending_commands[client_id]
+                    del self.pending_commands[client_id]
                 # Check if there is a command waiting for THIS client
                 if client_id in self.pending_commands:
                     command = self.pending_commands.pop(client_id) # Use pop to get and remove
@@ -127,7 +130,7 @@ class RemoteServer:
         """Handle response from client"""
         response_type = response.get('type', 'unknown')
         
-        if response_type == 'cmd_result':
+        if response_type == 'cmd_result' or response_type=='shell_result':
             print(f"\n[CMD Result from {client_id}]")
             print(response.get('data', 'No output'))
             print("-" * 50)
