@@ -586,7 +586,7 @@ $Shortcut.Save()
         except Exception as e:
             print(f"[!] Send error: {e}")
     
-        def receive_data(self, sock, timeout=5):
+    def receive_data(self, sock, timeout=5):
         """Receive JSON data from socket"""
         try:
             sock.settimeout(timeout)
